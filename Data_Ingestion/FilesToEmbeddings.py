@@ -72,19 +72,54 @@ class FilesToEmbeddings:
         print("📋 Formatting document structure...")
         structured_doc = self.adi_bridge.format_result_as_structured_document(analysis_result)
         
-        # Step 3: Generate chunks
-        print("✂️  Generating intelligent chunks...")
-        chunks = self.tokenizer.chunk_adi_document(
+        # Save structured document for debugging
+        debug_path = Path(f"./debug_structured_{document_id}.json")
+        with open(debug_path, 'w', encoding='utf-8') as f:
+            json.dump(structured_doc, f, indent=2, ensure_ascii=False)
+        print(f"   📝 Saved structured document to: {debug_path}")
+        
+        # Analyze table distribution for debugging
+        total_tables = structured_doc.get('statistics', {}).get('total_tables', 0)
+        sections_with_tables = 0
+        table_count_in_sections = 0
+        
+        for section in structured_doc.get('sections', []):
+            if section.get('tables') and len(section['tables']) > 0:
+                sections_with_tables += 1
+                table_count_in_sections += len(section['tables'])
+                print(f"   📊 Section '{section.get('sectionTitle', 'Unknown')}' has {len(section['tables'])} tables")
+        
+        print(f"\n   ⚠️  Table Analysis:")
+        print(f"      - Total tables reported: {total_tables}")
+        print(f"      - Tables found in sections: {table_count_in_sections}")
+        print(f"      - Sections with tables: {sections_with_tables}")
+        
+        if total_tables != table_count_in_sections:
+            print(f"   ⚠️  WARNING: Table count mismatch! {total_tables} total vs {table_count_in_sections} in sections")
+            print(f"      This means {total_tables - table_count_in_sections} tables are not properly associated with sections")
+            print(f"      Tables may be processed as regular content (which is fine if they're in markdown)")
+        
+        # Step 3: Generate chunks using the correct method name
+        print("\n✂️  Generating intelligent chunks...")
+        chunks = self.tokenizer.chunk_structured_adi_document(
             structured_doc,
-            target_chunk_size=self.target_chunk_size,
+            target_tokens_per_chunk=self.target_chunk_size,
             overlap_percentage=self.overlap_percentage
         )
         
         print(f"   Generated {len(chunks)} chunks")
         
+        # Analyze chunks for table content
+        chunks_with_table_type = [c for c in chunks if c['metadata'].get('chunk_type') == 'table']
+        chunks_with_table_markers = [c for c in chunks if '|' in c['content'] and '---|' in c['content']]
+        
+        print(f"   📊 Chunk Analysis:")
+        print(f"      - Chunks marked as 'table' type: {len(chunks_with_table_type)}")
+        print(f"      - Chunks containing markdown tables: {len(chunks_with_table_markers)}")
+        
         # Step 4: Generate embeddings
-        print("🧠 Generating embeddings...")
-        chunk_texts = [chunk['text'] for chunk in chunks]
+        print("\n🧠 Generating embeddings...")
+        chunk_texts = [chunk['content'] for chunk in chunks]
         embeddings = self.embedder.embed_text(chunk_texts)
         
         # Step 5: Prepare final results with metadata
@@ -158,13 +193,14 @@ class FilesToEmbeddings:
         return hash_md5.hexdigest()[:8]  # Use first 8 chars for brevity
 
     def _prepare_vector_db_entries(self, 
-                                  chunks: List[Dict[str, Any]], 
-                                  embeddings, 
-                                  document_id: str,
-                                  file_path: Path,
-                                  structured_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
+                                chunks: List[Dict[str, Any]], 
+                                embeddings, 
+                                document_id: str,
+                                file_path: Path,
+                                structured_doc: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
         Prepare final entries for vector database with comprehensive metadata.
+        Optimized for Azure AI Search and RAG utilization.
         """
         results = []
         
@@ -175,54 +211,41 @@ class FilesToEmbeddings:
             # Create unique chunk ID
             chunk_id = f"{document_id}_chunk_{i:04d}"
             
-            # Prepare comprehensive metadata
-            metadata = {
-                # Document-level metadata
-                "document_id": document_id,
+            # Extract chunk metadata (handle missing keys gracefully)
+            chunk_metadata = chunk.get('metadata', {})
+            
+            # Create comprehensive metadata dictionary
+            full_metadata = {
                 "document_title": structured_doc.get('title', file_path.stem),
                 "document_filename": file_path.name,
-                "document_pages": structured_doc.get('total_pages', 0),
                 "file_size_bytes": file_stats.st_size,
                 "file_modified": file_stats.st_mtime,
-                
-                # Chunk-level metadata
-                "chunk_id": chunk_id,
-                "chunk_index": i,
-                "chunk_type": chunk['metadata']['chunk_type'],
-                "token_count": chunk['metadata']['token_count'],
-                "character_count": len(chunk['text']),
-                
-                # Section metadata
-                "section_title": chunk['metadata'].get('section_title', ''),
-                "subsection_title": chunk['metadata'].get('subsection_title', ''),
-                "page_number": chunk['metadata'].get('page', 0),
-                
-                # Special handling for tables
-                "is_table": chunk['metadata']['chunk_type'] in ['table', 'subsection_table'],
-                "table_index": chunk['metadata'].get('table_index'),
-                "exceeds_target": chunk['metadata'].get('exceeds_target', False),
-                
-                # Overlap information
-                "has_overlap": chunk.get('has_overlap', False),
-                "overlap_from_chunk": chunk.get('overlap_from_chunk'),
-                
-                # Document statistics for context
-                "total_chunks_in_document": len(chunks),
+                "position_in_document": i / len(chunks) if len(chunks) > 0 else 0,
+                "total_chunks": len(chunks),
                 "total_sections_in_document": structured_doc.get('statistics', {}).get('total_sections', 0),
                 "total_tables_in_document": structured_doc.get('statistics', {}).get('total_tables', 0),
+                **chunk_metadata  # Unpack all chunk metadata
             }
             
-            # Add any document-specific metadata from ADI
-            doc_metadata = structured_doc.get('metadata', {})
-            for key, value in doc_metadata.items():
-                metadata[f"doc_meta_{key}"] = value
-            
-            # Create final entry
+            # Create FLAT entry for Azure AI Search with all metadata unpacked
             entry = {
+                # Required fields for Azure AI Search
                 "id": chunk_id,
-                "text": chunk['text'],
-                "embedding": embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding),
-                "metadata": metadata
+                "content": chunk.get('content', ''),
+                "contentVector": embedding.tolist() if hasattr(embedding, 'tolist') else list(embedding),
+                
+                # Core fields
+                "title": f"{structured_doc.get('title', '')} - {chunk_metadata.get('section_title', '')}",
+                "document_id": document_id,
+                "chunk_index": i,
+                "chunk_type": chunk_metadata.get('chunk_type', 'content'),
+                "section_title": chunk_metadata.get('section_title', ''),
+                "is_table": chunk_metadata.get('chunk_type') == 'table',
+                "token_count": chunk_metadata.get('token_count', 0),
+                "table_page_number": chunk_metadata.get('table_page_number'),
+                
+                # Unpack ALL metadata fields to top level (no nested metadata object)
+                **full_metadata
             }
             
             results.append(entry)
@@ -232,6 +255,27 @@ class FilesToEmbeddings:
     def get_embedding_dimension(self) -> int:
         """Get the embedding dimension for vector database configuration."""
         return self.embedder.get_embedding_dimension()
+
+    def save_results_for_azure_search(self, results: List[Dict[str, Any]], output_path: Union[str, Path]) -> None:
+        """
+        Save embedding results in a format ready for Azure AI Search upload.
+        
+        Args:
+            results: Results from process_document or process_multiple_documents
+            output_path: Path where to save the JSON file
+        """
+        output_path = Path(output_path)
+        
+        # Format for Azure AI Search batch upload
+        azure_search_format = {
+            "value": results  # Azure AI Search expects documents in a "value" array
+        }
+        
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(azure_search_format, f, indent=2, ensure_ascii=False)
+        
+        print(f"💾 Azure AI Search ready file saved to: {output_path}")
+        print(f"   Ready to upload {len(results)} documents to your index")
 
     def save_results_to_json(self, results: List[Dict[str, Any]], output_path: Union[str, Path]) -> None:
         """
@@ -246,10 +290,10 @@ class FilesToEmbeddings:
         # Create summary for the JSON file
         summary = {
             "total_entries": len(results),
-            "embedding_dimension": len(results[0]["embedding"]) if results else 0,
-            "documents_processed": len(set(r["metadata"]["document_id"] for r in results)),
-            "chunk_types": list(set(r["metadata"]["chunk_type"] for r in results)),
-            "total_tokens": sum(r["metadata"]["token_count"] for r in results),
+            "embedding_dimension": len(results[0]["contentVector"]) if results else 0,
+            "documents_processed": len(set(r["document_id"] for r in results)),
+            "chunk_types": list(set(r["chunk_type"] for r in results)),
+            "total_tokens": sum(r["token_count"] for r in results),  # Fixed: removed nested metadata access
             "results": results
         }
         
@@ -257,7 +301,8 @@ class FilesToEmbeddings:
             json.dump(summary, f, indent=2, ensure_ascii=False)
         
         print(f"💾 Results saved to: {output_path}")
-
+        print(f"   Total entries: {len(results)}")
+        print(f"   File size: {output_path.stat().st_size / 1024:.1f} KB")
 
 # Example usage and testing
 if __name__ == "__main__":
@@ -281,34 +326,91 @@ if __name__ == "__main__":
         print(f"\n📊 Results Summary:")
         print(f"   Total embeddings: {len(results)}")
         print(f"   Embedding dimension: {pipeline.get_embedding_dimension()}")
-        print(f"   Average tokens per chunk: {sum(r['metadata']['token_count'] for r in results) / len(results):.1f}")
+        
+        # Calculate average tokens using the flattened structure
+        avg_tokens = sum(r['token_count'] for r in results) / len(results) if results else 0
+        print(f"   Average tokens per chunk: {avg_tokens:.1f}")
         
         # Show chunk type distribution
         chunk_types = {}
         for result in results:
-            ct = result['metadata']['chunk_type']
+            ct = result['chunk_type']  # Access directly from result
             chunk_types[ct] = chunk_types.get(ct, 0) + 1
         
         print(f"   Chunk types:")
         for ct, count in chunk_types.items():
             print(f"     {ct}: {count}")
         
+        # Show tables count
+        table_chunks = [r for r in results if r['is_table']]
+        print(f"   Table chunks: {len(table_chunks)}")
+        
+        # Detailed table analysis
+        print(f"\n📊 Table Content Analysis:")
+        chunks_with_tables = []
+        for r in results:
+            if '|' in r['content'] and '---|' in r['content']:
+                chunks_with_tables.append(r)
+        print(f"   Chunks containing markdown tables: {len(chunks_with_tables)}")
+        
+        # Show which chunks contain tables
+        if chunks_with_tables:
+            print(f"\n   Chunks with table content:")
+            for chunk in chunks_with_tables[:3]:  # Show first 3
+                print(f"     - {chunk['id']} ({chunk['chunk_type']})")
+                # Show snippet of table
+                lines = chunk['content'].split('\n')
+                table_lines = [l for l in lines if '|' in l][:3]
+                for line in table_lines:
+                    print(f"       {line[:80]}...")
+        
         # Show first result structure
         print(f"\n🔍 First result structure:")
         first_result = results[0]
         print(f"   ID: {first_result['id']}")
-        print(f"   Text length: {len(first_result['text'])} chars")
-        print(f"   Embedding shape: {len(first_result['embedding'])}")
-        print(f"   Metadata keys: {list(first_result['metadata'].keys())}")
-        print(f"   Text preview: {first_result['text'][:200]}...")
+        print(f"   Title: {first_result['title']}")
+        print(f"   Content length: {len(first_result['content'])} chars")
+        print(f"   Embedding dimension: {len(first_result['contentVector'])}")
+        print(f"   Section: {first_result['section_title']}")
+        print(f"   Chunk type: {first_result['chunk_type']}")
+        print(f"   Token count: {first_result['token_count']}")
+        print(f"   Is table: {first_result['is_table']}")
+        print(f"   Table page: {first_result.get('table_page_number', 'N/A')}")
         
-        # Save to JSON for inspection
+        # Show text preview
+        print(f"\n📄 Content preview (first 300 chars):")
+        print(f"   {first_result['content'][:300]}...")
+        
+        # Save both formats for inspection
+        print(f"\n💾 Saving results...")
+        
+        # Save regular JSON for inspection
         pipeline.save_results_to_json(results, "./test_embeddings_output.json")
+        
+        # Save Azure AI Search format
+        pipeline.save_results_for_azure_search(results, "./azure_search_upload.json")
+        
+        # Show some sample chunks
+        print(f"\n📑 Sample chunks:")
+        for i, result in enumerate(results[:3]):
+            print(f"\n   Chunk {i + 1}:")
+            print(f"     ID: {result['id']}")
+            print(f"     Type: {result['chunk_type']}")
+            print(f"     Section: {result['section_title']}")
+            print(f"     Tokens: {result['token_count']}")
+            print(f"     Preview: {result['content'][:100]}...")
+        
+        print(f"\n✅ Complete! Check these files for inspection:")
+        print(f"   - debug_structured_KeypointSiteAlignment.json (structured document)")
+        print(f"   - test_embeddings_output.json (embedding results)")
+        print(f"   - azure_search_upload.json (Azure AI Search format)")
         
     else:
         print(f"❌ Test file not found: {test_file}")
         print("   Please ensure the test PDF exists or update the path")
     
     # Example of batch processing
-    # test_files = ["./Data/doc1.pdf", "./Data/doc2.pdf"]
-    # batch_results = pipeline.process_multiple_documents(test_files)
+    print("\n📚 Example batch processing (commented out):")
+    print("   # test_files = ['./Data/doc1.pdf', './Data/doc2.pdf']")
+    print("   # batch_results = pipeline.process_multiple_documents(test_files)")
+    print("   # pipeline.save_results_to_json(batch_results, './batch_embeddings.json')")

@@ -35,8 +35,7 @@ class LocalEmbedder:
         
         embeddings = self.model.encode(text, convert_to_numpy=True)
         return embeddings
-    
-    
+     
     def get_embedding_dimension(self) -> int:
         """Get the dimension of embeddings from this model"""
         dim = self.model.get_sentence_embedding_dimension()

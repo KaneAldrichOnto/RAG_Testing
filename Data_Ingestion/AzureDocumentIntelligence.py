@@ -3,6 +3,7 @@ import os
 import pickle
 from pathlib import Path
 import json
+from collections import defaultdict
 
 from azure.ai.formrecognizer import DocumentAnalysisClient, AnalyzeResult
 from azure.core.credentials import AzureKeyCredential
@@ -76,229 +77,149 @@ class AzureDocumentIntelligenceBridge:
         Format ADI output into a hierarchical document structure with sections.
         Each section contains its title, content, tables, and other elements.
         """
-        
-        # First, create a mapping of page elements by their position
-        page_elements = {}
-        
-        # Collect all elements with their page positions
-        if analysis_result.paragraphs:
-            for paragraph in analysis_result.paragraphs:
-                if paragraph.bounding_regions:
-                    for region in paragraph.bounding_regions:
-                        page_num = region.page_number
-                        if page_num not in page_elements:
-                            page_elements[page_num] = []
-                        
-                        # Get the top Y coordinate for sorting
-                        min_y = min(point.y for point in region.polygon) if region.polygon else 0
-                        
-                        page_elements[page_num].append({
-                            "type": "paragraph",
-                            "content": paragraph.content,
-                            "role": paragraph.role,
-                            "position": min_y,
-                            "page": page_num,
-                            "data": paragraph
-                        })
-        
-        # Add tables with their positions
-        if analysis_result.tables:
-            for table in analysis_result.tables:
-                if table.bounding_regions:
-                    for region in table.bounding_regions:
-                        page_num = region.page_number
-                        if page_num not in page_elements:
-                            page_elements[page_num] = []
-                        
-                        min_y = min(point.y for point in region.polygon) if region.polygon else 0
-                        
-                        # Format table data
-                        formatted_table = self._format_table(table)
-                        
-                        page_elements[page_num].append({
-                            "type": "table",
-                            "position": min_y,
-                            "page": page_num,
-                            "data": formatted_table
-                        })
-        
-        # Sort elements by position on each page
-        for page_num in page_elements:
-            page_elements[page_num].sort(key=lambda x: x["position"])
-        
-        # Now build the document structure
-        document = {
-            "title": None,
-            "metadata": {},
-            "sections": [],
-            "appendices": [],
-            "total_pages": len(analysis_result.pages) if analysis_result.pages else 0
-        }
-        
-        # Extract key-value pairs as metadata
-        if analysis_result.key_value_pairs:
-            for kv_pair in analysis_result.key_value_pairs:
-                if kv_pair.key and kv_pair.value:
-                    key = kv_pair.key.content
-                    value = kv_pair.value.content
-                    document["metadata"][key] = value
-        
-        # Build sections from the ordered elements
-        current_section = None
-        current_subsection = None
-        
-        # Process elements in page order
-        for page_num in sorted(page_elements.keys()):
-            for element in page_elements[page_num]:
-                
-                if element["type"] == "paragraph":
-                    role = element["role"]
-                    content = element["content"]
-                    
-                    # Document title (usually appears once at the beginning)
-                    if role == "title" and not document["title"]:
-                        document["title"] = content
-                        continue
-                    
-                    # Section heading - start a new section
-                    elif role == "sectionHeading":
-                        # Save current section if exists
-                        if current_section:
-                            if current_subsection:
-                                current_section["subsections"].append(current_subsection)
-                                current_subsection = None
-                            document["sections"].append(current_section)
-                        
-                        # Create new section
-                        current_section = {
-                            "title": content,
-                            "page_start": element["page"],
-                            "content": [],
-                            "tables": [],
-                            "figures": [],
-                            "subsections": []
-                        }
-                    
-                    # Subsection heading (if you want to capture nested structure)
-                    elif role in ["pageHeader", "subheading"] and current_section:
-                        # This could be a subsection
-                        if current_subsection:
-                            current_section["subsections"].append(current_subsection)
-                        
-                        current_subsection = {
-                            "title": content,
-                            "content": [],
-                            "tables": []
-                        }
-                    
-                    # Regular content
-                    else:
-                        # Skip page headers/footers unless you want them
-                        if role in ["pageFooter", "pageNumber"]:
-                            continue
-                        
-                        # Add content to appropriate container
-                        if current_subsection:
-                            current_subsection["content"].append({
-                                "text": content,
-                                "page": element["page"],
-                                "type": role or "body"
-                            })
-                        elif current_section:
-                            current_section["content"].append({
-                                "text": content,
-                                "page": element["page"],
-                                "type": role or "body"
-                            })
-                        else:
-                            # Content before first section - could be introduction/preface
-                            if not document["sections"]:
-                                # Create an introduction section
-                                current_section = {
-                                    "title": "Introduction",
-                                    "page_start": element["page"],
-                                    "content": [{
-                                        "text": content,
-                                        "page": element["page"],
-                                        "type": role or "body"
-                                    }],
-                                    "tables": [],
-                                    "figures": [],
-                                    "subsections": []
-                                }
-                
-                elif element["type"] == "table":
-                    # Add table to current section or subsection
-                    if current_subsection:
-                        current_subsection["tables"].append(element["data"])
-                    elif current_section:
-                        current_section["tables"].append(element["data"])
-                    else:
-                        # Table before first section
-                        if not document["sections"]:
-                            current_section = {
-                                "title": "Document Start",
-                                "page_start": element["page"],
-                                "content": [],
-                                "tables": [element["data"]],
-                                "figures": [],
-                                "subsections": []
-                            }
-        
-        # Don't forget to add the last section
-        if current_section:
-            if current_subsection:
-                current_section["subsections"].append(current_subsection)
-            document["sections"].append(current_section)
-        
-        # Add summary statistics
-        document["statistics"] = {
-            "total_sections": len(document["sections"]),
-            "total_tables": sum(len(s.get("tables", [])) for s in document["sections"]),
-            "total_paragraphs": len(analysis_result.paragraphs) if analysis_result.paragraphs else 0,
-            "total_pages": document["total_pages"]
-        }
-        
-        return document
+        # Objects to Hold Document Structure
+        document_sections = defaultdict(dict)
+        current_section_title = "Document_Opening"
+        document_sections[current_section_title] = {
+                        "sectionTitle": current_section_title,
+                        "pageNumber": [],
+                        "content": [],
+                        "tables": []    
+                    }
+        document_title = ""
+        page_to_table_data = defaultdict(list)
 
-    def _format_table(self, table) -> dict:
-        """Helper function to format a table into a more usable structure"""
-        
-        # Initialize table as 2D array
-        formatted_table = {
-            "row_count": table.row_count,
-            "column_count": table.column_count,
-            "headers": [],
-            "rows": []
+        # Iterate Over Tables to Map to Pages to Avoid Adding as Raw Text. Add Tables to Document Structure Table Section
+        if analysis_result.tables:
+            for table_index, table in enumerate(analysis_result.tables):
+                table_markdown_string = ""
+                table_headers = []   
+                table_markdown_string = self._format_table(table)    
+                table_page_number = table.bounding_regions[0].page_number if table.bounding_regions else None
+                
+                if table_page_number is not None:
+                    # Create a dictionary for each table with all its data
+                    table_data = {
+                        "boundingBox": table.bounding_regions[0].polygon if table.bounding_regions else [],
+                        "tableMarkdown": table_markdown_string,
+                        "tableAddedToSection": False
+                    }
+                    
+                    # Append to the list for this page (handles multiple tables per page)
+                    page_to_table_data[table_page_number].append(table_data)
+                else:
+                    raise ValueError("Table does not have a valid bounding region with page number.")
+
+        if analysis_result.paragraphs:
+            for section in analysis_result.paragraphs:
+                # Just Skipped for Table Overlap
+                skipSectionDueToTableOverlap = False
+                # Get Page Number
+                current_page_number = section.bounding_regions[0].page_number if section.bounding_regions else None
+                # Get Section Bounding Box
+                section_bounding_box = section.bounding_regions[0].polygon if section.bounding_regions else []
+                # Get Section Type
+                section_role = section.role if section.role else "content"
+                # Get Section Content
+                section_content = section.content.strip() if section.content else ""
+                # Skip Unimportant Sections
+                if section_role in ["pageFooter", "pageHeader", "pageNumber"]:
+                    continue  # Skip non-content sections
+                
+                # Check Overlap With Tables on This Page, Add Markdown Table if Overlap is Present
+                if current_page_number in page_to_table_data.keys():
+                    # Check against all tables on this page
+                    for table_data in page_to_table_data[current_page_number]:
+                        table_bounding_box = table_data["boundingBox"]
+                        
+                        if table_bounding_box:  # Make sure bounding box exists
+                            table_top_left = table_bounding_box[0]
+                            table_bottom_right = table_bounding_box[2]
+
+                            # Simple Bounding Box Check
+                            if table_top_left[0] - 0.1 <= section_bounding_box[0][0] <= table_bottom_right[0] + 0.1 and \
+                            table_top_left[1] - 0.1 <= section_bounding_box[0][1] <= table_bottom_right[1] + 0.1:
+                                # Add Table as Markdown to Current Section
+                                if not table_data["tableAddedToSection"]:
+                                    document_sections[current_section_title]["tables"].append({
+                                        "tableMarkdown": table_data["tableMarkdown"],
+                                        "tablePageNumber": current_page_number
+                                    })
+                                    table_data["tableAddedToSection"] = True
+                                skipSectionDueToTableOverlap = True
+                                break  # Only add each overlapping table once per section
+                
+                # Did we just skip adding content because of table overlap?
+                if skipSectionDueToTableOverlap:
+                    continue
+
+                # If Title, Set or Append to Document Title
+                if section_role == "title":
+                    if document_title == "":
+                        document_title = section_content
+                    else:
+                        document_title += " " + section_content
+                # If Section Heading, Create New Section Entry
+                elif section_role == "sectionHeading":
+                    document_sections[section_content + "_" + str(current_page_number)] = {
+                        "sectionTitle": section_content,
+                        "pageNumber": [current_page_number],
+                        "content": [],
+                        "tables": []    
+                    }
+                    # Set Title of Last Section So We Can Add Content to It
+                    current_section_title = section_content + "_" + str(current_page_number)
+                # If Section Content, Prepare to Append to Current Section
+                elif section_role == "content":
+                    document_sections[current_section_title]["content"].append(section_content)
+                    if current_page_number not in document_sections[current_section_title]["pageNumber"]:
+                        document_sections[current_section_title]["pageNumber"].append(current_page_number)
+
+        return {
+            "title": document_title,
+            "sections": list(document_sections.values()),
+            "total_pages": len(analysis_result.pages) if analysis_result.pages else 0,
+            "statistics": {
+                "total_sections": len(document_sections),
+                "total_tables": len(analysis_result.tables) if analysis_result.tables else 0
+            }      
         }
+
+    def _format_table(self, table) -> str:
+        """Helper function to format a table into markdown"""
+        row_count = table.row_count
+        column_count = table.column_count
+        table_matrix = [["" for _ in range(column_count)] for _ in range(row_count)]
         
-        # Create empty 2D array
-        table_array = [['' for _ in range(table.column_count)] for _ in range(table.row_count)]
-        
-        # Fill the array with cell contents
+        # Fill the matrix with cell content
         for cell in table.cells:
-            row_idx = cell.row_index
-            col_idx = cell.column_index
+            table_matrix[cell.row_index][cell.column_index] = cell.content
+            if cell.row_span > 1 or cell.column_span > 1:
+                # Handle merged cells if necessary
+                for r in range(cell.row_index, cell.row_index + cell.row_span):
+                    for c in range(cell.column_index, cell.column_index + cell.column_span):
+                        if r == cell.row_index and c == cell.column_index:
+                            continue
+                        table_matrix[r][c] = ""  # Mark merged cells as Empty
+        
+        # Convert matrix to markdown string
+        markdown_lines = []
+        
+        # Add header row (first row)
+        if row_count > 0:
+            header_row = "| " + " | ".join(str(cell).strip() for cell in table_matrix[0]) + " |"
+            markdown_lines.append(header_row)
             
-            # Handle cell spans if needed
-            for r in range(cell.row_span or 1):
-                for c in range(cell.column_span or 1):
-                    if row_idx + r < table.row_count and col_idx + c < table.column_count:
-                        table_array[row_idx + r][col_idx + c] = cell.content
+            # Add separator row
+            separator = "|" + "---|" * column_count
+            markdown_lines.append(separator)
+            
+            # Add data rows (remaining rows)
+            for row in table_matrix[1:]:
+                data_row = "| " + " | ".join(str(cell).strip() for cell in row) + " |"
+                markdown_lines.append(data_row)
         
-        # Identify headers (usually first row or cells marked as headers)
-        header_cells = [cell for cell in table.cells if cell.kind == "columnHeader" or cell.row_index == 0]
-        
-        if header_cells:
-            # Use first row as headers
-            formatted_table["headers"] = table_array[0]
-            formatted_table["rows"] = table_array[1:]
-        else:
-            # No clear headers, use generic column names
-            formatted_table["headers"] = [f"Column {i+1}" for i in range(table.column_count)]
-            formatted_table["rows"] = table_array
-        
-        return formatted_table
+        return "\n".join(markdown_lines)  
 
     def save_structured_document_as_json(self, structured_doc: dict, file_path: str) -> None:
         """Save the structured document as a JSON file for inspection"""

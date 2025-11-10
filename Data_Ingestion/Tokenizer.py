@@ -13,377 +13,169 @@ class Tokenizer:
             self.tokenizer = tiktoken.get_encoding("cl100k_base")
             print(f"Model {model} not found, using cl100k_base encoding")
     
-    def count_tokens(self, text: Union[str, List[str]]) -> Union[int, List[int]]:
-        if isinstance(text, str):
-            return len(self.tokenizer.encode(text))
-        else:
-            return [len(self.tokenizer.encode(t)) for t in text]
+    def count_tokens(self, text: str) -> int:
+        tokens = self.tokenizer.encode(text)
+        return len(tokens)
     
-    def tokenize_with_count(self, text: str) -> Tuple[List[str], int]:
-        # Get token IDs
-        token_ids = self.tokenizer.encode(text)
-        # Convert token IDs back to strings
-        tokens = [self.tokenizer.decode([token_id]) for token_id in token_ids]
-        return tokens, len(tokens)
-
-    def chunk_adi_document(self, 
-                          structured_doc: Dict[str, Any], 
-                          target_chunk_size: int = 512,
-                          overlap_percentage: float = 0.25,
-                          min_chunk_size: int = 100) -> List[Dict[str, Any]]:
+    def _split_markdown_table(self, markdown_table: str, division_factor: int) -> List[str]:
         """
-        Intelligently chunk Azure Document Intelligence output for RAG.
+        Split a markdown table into division_factor parts of equal or close to equal size.
+        Only splits on row boundaries, never within a row.
         
         Args:
-            structured_doc: Output from format_result_as_structured_document()
-            target_chunk_size: Target size for chunks in tokens (default 512)
-            overlap_percentage: Percentage of overlap for beginning of chunks (default 25%)
-            min_chunk_size: Minimum chunk size in tokens
+            markdown_table: The markdown table as a string
+            division_factor: Number of parts to split the table into
             
         Returns:
-            List of chunk dictionaries containing text and metadata
+            List of markdown table strings, each with headers and portion of rows
         """
+        if division_factor <= 1:
+            return [markdown_table]
+        
+        lines = markdown_table.strip().split('\n')
+        
+        # Find header and separator lines
+        header_line = None
+        separator_line = None
+        data_start_idx = 0
+        
+        for i, line in enumerate(lines):
+            if '|' in line and header_line is None:
+                header_line = line
+            elif '---' in line and '|' in line and separator_line is None:
+                separator_line = line
+                data_start_idx = i + 1
+                break
+        
+        if header_line is None or separator_line is None:
+            # Not a valid markdown table, return as single part
+            return [markdown_table]
+        
+        # Get data rows (everything after header and separator)
+        data_rows = lines[data_start_idx:]
+        
+        # Filter out empty lines
+        data_rows = [row for row in data_rows if row.strip() and '|' in row]
+        
+        if len(data_rows) == 0:
+            # No data rows, return original table
+            return [markdown_table]
+        
+        if len(data_rows) < division_factor:
+            # Can't split into more parts than we have rows
+            division_factor = len(data_rows)
+        
+        # Calculate rows per part
+        rows_per_part = len(data_rows) // division_factor
+        remainder_rows = len(data_rows) % division_factor
+        
+        split_tables = []
+        current_row_idx = 0
+        
+        for part_num in range(division_factor):
+            # Calculate how many rows for this part
+            rows_in_this_part = rows_per_part
+            if part_num < remainder_rows:
+                rows_in_this_part += 1  # Distribute remainder rows to first parts
+            
+            # Build this part of the table
+            table_part = header_line + '\n' + separator_line + '\n'
+            
+            # Add the rows for this part
+            for row_idx in range(rows_in_this_part):
+                if current_row_idx < len(data_rows):
+                    table_part += data_rows[current_row_idx] + '\n'
+                    current_row_idx += 1
+            
+            split_tables.append(table_part.strip())
+        
+        return split_tables
+    
+    def chunk_structured_adi_document(self, 
+                                      structured_document : dict, 
+                                      target_tokens_per_chunk : int,
+                                      overlap_percentage : float) -> List[dict]:
         chunks = []
-        overlap_size = int(target_chunk_size * overlap_percentage)
-        
-        # Process each section
-        for section_idx, section in enumerate(structured_doc.get('sections', [])):
-            section_title = section.get('title', f'Section {section_idx + 1}')
-            section_metadata = {
-                'section_title': section_title,
-                'page_start': section.get('page_start', 0),
-                'document_title': structured_doc.get('title', 'Unknown Document')
-            }
-            
-            # Build section content with proper structure
-            section_chunks = self._chunk_section(
-                section=section,
-                section_metadata=section_metadata,
-                target_chunk_size=target_chunk_size,
-                overlap_size=overlap_size,
-                min_chunk_size=min_chunk_size
-            )
-            
-            chunks.extend(section_chunks)
-        
-        # Add overlap between chunks (except for the first chunk)
-        final_chunks = []
-        for i, chunk in enumerate(chunks):
-            if i > 0 and overlap_size > 0:
-                # Get overlap text from previous chunk
-                prev_text = chunks[i-1]['text']
-                prev_tokens = self.tokenizer.encode(prev_text)
-                
-                if len(prev_tokens) > overlap_size:
-                    # Take last 25% of previous chunk
-                    overlap_tokens = prev_tokens[-overlap_size:]
-                    overlap_text = self.tokenizer.decode(overlap_tokens)
-                    
-                    # Add overlap to current chunk if it doesn't already have it
-                    if not chunk['text'].startswith(overlap_text):
-                        chunk['text'] = overlap_text + "\n\n" + chunk['text']
-                        chunk['has_overlap'] = True
-                        chunk['overlap_from_chunk'] = i - 1
-            
-            final_chunks.append(chunk)
-        
-        return final_chunks
+        for document_section in structured_document.get('sections', []):
+            section_title = document_section['sectionTitle']
 
-    def _chunk_section(self, 
-                    section: Dict[str, Any],
-                    section_metadata: Dict[str, Any],
-                    target_chunk_size: int,
-                    overlap_size: int,
-                    min_chunk_size: int) -> List[Dict[str, Any]]:
-        """
-        Chunk a single section while respecting semantic boundaries.
-        """
-        chunks = []
-        current_chunk_text = []
-        current_chunk_tokens = 0
-        
-        # Always start with section title for context
-        section_header = f"# {section['title']}\n\n"
-        header_tokens = self.count_tokens(section_header)
-        
-        # Process subsections if they exist
-        if section.get('subsections'):
-            for subsection in section['subsections']:
-                subsection_chunks = self._process_subsection(
-                    subsection=subsection,
-                    parent_header=section_header,
-                    section_metadata=section_metadata,
-                    target_chunk_size=target_chunk_size,
-                    min_chunk_size=min_chunk_size
-                )
-                chunks.extend(subsection_chunks)
-        
-        # Process main section content
-        current_chunk_text = [section_header]
-        current_chunk_tokens = header_tokens
-        
-        # Get table text to filter out
-        table_texts = set()
-        for table in section.get('tables', []):
-            # Collect all text from table cells to filter out
-            for row in table.get('rows', []):
-                for cell in row:
-                    if cell and str(cell).strip():
-                        table_texts.add(str(cell).strip())
-            # Also add headers
-            for header in table.get('headers', []):
-                if header and str(header).strip():
-                    table_texts.add(str(header).strip())
-        
-        # Process paragraphs (filtering out table text)
-        for content_item in section.get('content', []):
-            paragraph_text = content_item.get('text', '')
-            
-            # Skip if this is empty, marked as table, or contains table data
-            if not paragraph_text.strip():
-                continue
-            
-            # Check if this text is actually from a table
-            is_table_content = (
-                content_item.get('type') == 'table' or
-                paragraph_text.strip() in table_texts or
-                any(table_text in paragraph_text for table_text in table_texts if len(table_text) > 20)
-            )
-            
-            if is_table_content:
-                continue
+            current_chunk = section_title + "\n"
+            current_token_count = self.count_tokens(current_chunk)
+
+            for content_index, content_string in enumerate(document_section.get('content', [])):
+                content_token_count = self.count_tokens(content_string)
                 
-            paragraph_tokens = self.count_tokens(paragraph_text)
-            
-            # Check if adding this paragraph would exceed target size
-            if current_chunk_tokens + paragraph_tokens > target_chunk_size:
-                # If current chunk is big enough, save it
-                if current_chunk_tokens >= min_chunk_size:
-                    chunk_text = '\n\n'.join(current_chunk_text)
+                if current_token_count + content_token_count <= target_tokens_per_chunk:
+                    current_chunk += content_string + "\n"
+                    current_token_count += content_token_count
+                elif current_token_count + content_token_count < target_tokens_per_chunk * 1.2:
+                    current_chunk += content_string + "\n"
+                    current_token_count += content_token_count
+                else:
                     chunks.append({
-                        'text': chunk_text,
+                        'content': current_chunk.strip(),
                         'metadata': {
-                            **section_metadata,
-                            'chunk_type': 'section_content',
-                            'page': content_item.get('page', 0),
-                            'token_count': current_chunk_tokens
-                        }
-                    })
-                    
-                    # Start new chunk with section header for context
-                    current_chunk_text = [section_header]
-                    current_chunk_tokens = header_tokens
-            
-            # Add paragraph to current chunk
-            current_chunk_text.append(paragraph_text)
-            current_chunk_tokens += paragraph_tokens
-        
-        # Process tables - try to keep with current content if it fits
-        for table_idx, table in enumerate(section.get('tables', [])):
-            table_text = self._format_table_for_chunk(table, table_idx)
-            table_tokens = self.count_tokens(table_text)
-            
-            # Check if table can fit in current chunk (allow some overflow)
-            # Allow up to 150% of target size if including a table
-            max_with_table = int(target_chunk_size * 1.5)
-            
-            if current_chunk_tokens + table_tokens <= max_with_table and len(current_chunk_text) > 1:
-                # Add table to current chunk
-                current_chunk_text.append(table_text)
-                current_chunk_tokens += table_tokens
-            else:
-                # Save current chunk if it has content
-                if len(current_chunk_text) > 1:  # More than just header
-                    chunk_text = '\n\n'.join(current_chunk_text)
-                    chunks.append({
-                        'text': chunk_text,
-                        'metadata': {
-                            **section_metadata,
-                            'chunk_type': 'section_content',
-                            'token_count': current_chunk_tokens
-                        }
-                    })
+                            'section_title': section_title,
+                            'token_count': current_token_count
+                        }})
+                    current_chunk = section_title + "\n" + content_string + "\n"
+                    current_token_count = self.count_tokens(current_chunk)
                 
-                # Create new chunk with table
-                table_chunk_text = section_header + table_text
+            # Add remaining content as chunk
+            if current_token_count > 0:
                 chunks.append({
-                    'text': table_chunk_text,
+                    'content': current_chunk.strip(),
                     'metadata': {
-                        **section_metadata,
-                        'chunk_type': 'table',
-                        'table_index': table_idx,
-                        'token_count': header_tokens + table_tokens,
-                        'exceeds_target': (header_tokens + table_tokens) > target_chunk_size
-                    }
-                })
-                
-                # Reset for next content
-                current_chunk_text = [section_header]
-                current_chunk_tokens = header_tokens
-        
-        # Save any remaining content
-        if len(current_chunk_text) > 1:  # More than just header
-            chunk_text = '\n\n'.join(current_chunk_text)
-            chunks.append({
-                'text': chunk_text,
-                'metadata': {
-                    **section_metadata,
-                    'chunk_type': 'section_content',
-                    'token_count': current_chunk_tokens
-                }
-            })
-        
-        return chunks
+                        'section_title': section_title,
+                        'token_count': current_token_count,
+                        'chunk_type': 'text'
+                    }})
+                current_chunk = section_title + "\n"
+                current_token_count = self.count_tokens(current_chunk)
+            
+            for table_index, table_section in enumerate(document_section['tables']):
+                markdown_table = table_section['tableMarkdown']
+                table_token_count = self.count_tokens(markdown_table)
 
-    def _process_subsection(self,
-                        subsection: Dict[str, Any],
-                        parent_header: str,
-                        section_metadata: Dict[str, Any],
-                        target_chunk_size: int,
-                        min_chunk_size: int) -> List[Dict[str, Any]]:
-        """
-        Process a subsection, keeping it with its parent section context.
-        """
-        chunks = []
-        
-        # Create subsection header with parent context
-        subsection_header = f"{parent_header}## {subsection['title']}\n\n"
-        header_tokens = self.count_tokens(subsection_header)
-        
-        current_chunk_text = [subsection_header]
-        current_chunk_tokens = header_tokens
-        
-        # Get table text to filter out
-        table_texts = set()
-        for table in subsection.get('tables', []):
-            for row in table.get('rows', []):
-                for cell in row:
-                    if cell and str(cell).strip():
-                        table_texts.add(str(cell).strip())
-            for header in table.get('headers', []):
-                if header and str(header).strip():
-                    table_texts.add(str(header).strip())
-        
-        # Process subsection content (filtering out table text)
-        for content_item in subsection.get('content', []):
-            paragraph_text = content_item.get('text', '')
-            
-            # Skip if this is empty
-            if not paragraph_text.strip():
-                continue
-            
-            # Check if this text is actually from a table
-            is_table_content = (
-                content_item.get('type') == 'table' or
-                paragraph_text.strip() in table_texts or
-                any(table_text in paragraph_text for table_text in table_texts if len(table_text) > 20)
-            )
-            
-            if is_table_content:
-                continue
-                
-            paragraph_tokens = self.count_tokens(paragraph_text)
-            
-            if current_chunk_tokens + paragraph_tokens > target_chunk_size:
-                if current_chunk_tokens >= min_chunk_size:
-                    chunk_text = '\n\n'.join(current_chunk_text)
+                if current_token_count + table_token_count <= target_tokens_per_chunk * 2:
+                    current_chunk += markdown_table + "\n"
+                    current_token_count += table_token_count
                     chunks.append({
-                        'text': chunk_text,
+                        'content': current_chunk.strip(),
                         'metadata': {
-                            **section_metadata,
-                            'subsection_title': subsection['title'],
-                            'chunk_type': 'subsection_content',
-                            'page': content_item.get('page', 0),
-                            'token_count': current_chunk_tokens
-                        }
-                    })
-                    
-                    current_chunk_text = [subsection_header]
-                    current_chunk_tokens = header_tokens
-            
-            current_chunk_text.append(paragraph_text)
-            current_chunk_tokens += paragraph_tokens
-        
-        # Process subsection tables - try to keep with content
-        for table_idx, table in enumerate(subsection.get('tables', [])):
-            table_text = self._format_table_for_chunk(table, table_idx)
-            table_tokens = self.count_tokens(table_text)
-            
-            # Allow up to 150% of target size if including a table
-            max_with_table = int(target_chunk_size * 1.5)
-            
-            if current_chunk_tokens + table_tokens <= max_with_table and len(current_chunk_text) > 1:
-                # Add table to current chunk
-                current_chunk_text.append(table_text)
-                current_chunk_tokens += table_tokens
-            else:
-                # Save current content if any
-                if len(current_chunk_text) > 1:
-                    chunk_text = '\n\n'.join(current_chunk_text)
-                    chunks.append({
-                        'text': chunk_text,
-                        'metadata': {
-                            **section_metadata,
-                            'subsection_title': subsection['title'],
-                            'chunk_type': 'subsection_content',
-                            'token_count': current_chunk_tokens
-                        }
-                    })
-                
-                # Add table as separate chunk with context
-                table_chunk_text = subsection_header + table_text
-                chunks.append({
-                    'text': table_chunk_text,
-                    'metadata': {
-                        **section_metadata,
-                        'subsection_title': subsection['title'],
-                        'chunk_type': 'subsection_table',
-                        'table_index': table_idx,
-                        'token_count': self.count_tokens(table_chunk_text),
-                        'exceeds_target': self.count_tokens(table_chunk_text) > target_chunk_size
-                    }
-                })
-                
-                current_chunk_text = [subsection_header]
-                current_chunk_tokens = header_tokens
-        
-        # Save remaining content
-        if len(current_chunk_text) > 1:
-            chunk_text = '\n\n'.join(current_chunk_text)
-            chunks.append({
-                'text': chunk_text,
-                'metadata': {
-                    **section_metadata,
-                    'subsection_title': subsection['title'],
-                    'chunk_type': 'subsection_content',
-                    'token_count': current_chunk_tokens
-                }
-            })
-        
+                            'section_title': section_title,
+                            'token_count': current_token_count,
+                            'chunk_type': 'table',
+                            'table_page_number': table_section['tablePageNumber']
+                        }})
+                else:
+                    addedSuccessfully = False
+                    for division_factor in range(1, 20):
+                        # Split Markdown Table into Smaller Parts
+                        split_tables = self._split_markdown_table(
+                            markdown_table, division_factor)
+                        
+                        split_table_token_count = self.count_tokens(split_tables[0])
+                        if current_token_count + split_table_token_count <= target_tokens_per_chunk * 2:
+                            for split_table in split_tables:
+                                split_table_token_count = self.count_tokens(split_table)
+
+                                if current_token_count + split_table_token_count <= target_tokens_per_chunk * 2:
+                                    current_chunk += markdown_table + "\n"
+                                    current_token_count += table_token_count
+                                    chunks.append({
+                                        'content': current_chunk.strip(),
+                                        'metadata': {
+                                            'section_title': section_title,
+                                            'token_count': current_token_count,
+                                            'chunk_type': 'table',
+                                            'table_page_number': table_section['tablePageNumber']
+                                        }})
+                                addedSuccessfully = True
+                        if addedSuccessfully:
+                            break
         return chunks
-
-    def _format_table_for_chunk(self, table: Dict[str, Any], table_idx: int) -> str:
-        """
-        Format a table for inclusion in a chunk.
-        """
-        table_text = f""
-        
-        # Add headers
-        if table.get('headers'):
-            table_text += "| " + " | ".join(str(h) for h in table['headers']) + " |\n"
-            table_text += "|" + "---|" * len(table['headers']) + "\n"
-        
-        # Add rows
-        for row in table.get('rows', []):
-            table_text += "| " + " | ".join(str(cell) for cell in row) + " |\n"
-        
-        return table_text
-
-    def split_adi_formatted_text(self, formatted_text : dict) -> List[str]:
-        """Legacy method - now use chunk_adi_document instead"""
-        chunks = self.chunk_adi_document(formatted_text)
-        return [chunk['text'] for chunk in chunks]
-
+                            
 
 # Test the tokenizer
 if __name__ == "__main__":
@@ -418,10 +210,10 @@ if __name__ == "__main__":
     
     # Chunk the document
     print("\nChunking document...")
-    chunks = tokenizer.chunk_adi_document(
+    chunks = tokenizer.chunk_structured_adi_document(
         structured_doc,
-        target_chunk_size=512,
-        overlap_percentage=0
+        target_tokens_per_chunk=512,
+        overlap_percentage=.25
     )
     
     # Print chunk statistics
@@ -449,6 +241,5 @@ if __name__ == "__main__":
         print(f"\n--- Chunk {i+1} ---")
         print(f"Type: {chunk['metadata']['chunk_type']}")
         print(f"Tokens: {chunk['metadata']['token_count']}")
-        print(f"Section: {chunk['metadata'].get('section_title', 'N/A')}")
-        print(f"Has overlap: {chunk.get('has_overlap', False)}")
-        print(f"Text preview:\n{chunk['text']}")
+        print(f"Section: {chunk['metadata']['section_title']}")
+        print(f"Text preview:\n{chunk['content']}")
