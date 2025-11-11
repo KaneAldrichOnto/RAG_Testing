@@ -342,12 +342,12 @@ class AzureDocumentIntelligenceBridge:
 if __name__ == "__main__":
     # Example usage
     bridge = AzureDocumentIntelligenceBridge()
-    if not os.path.exists("./KeypointSiteAlignment.pkl"):
+    if not os.path.exists("./Frontside_Manual.pkl"):
         print(f"Running ADI Call")
-        result = bridge.analyze_local_document("./Data/KeypointSiteAlignment.pdf", "KeypointSiteAlignment.pkl")
+        result = bridge.analyze_local_document("./Data/Frontside_Manual.pdf", "Frontside_Manual.pkl")
     
     # Load from cache
-    cached_result = bridge.load_analysis_result("KeypointSiteAlignment.pkl")
+    cached_result = bridge.load_analysis_result("Frontside_Manual.pkl")
     
     # Save the raw ADI result as JSON
     print("Saving raw ADI result as JSON...")

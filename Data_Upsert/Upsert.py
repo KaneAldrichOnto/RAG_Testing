@@ -63,7 +63,7 @@ class AzureSearchDataUploader:
                 SimpleField(name="chunk_index", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
                 SimpleField(name="chunk_type", type=SearchFieldDataType.String, filterable=True, facetable=True),
                 SearchableField(name="section_title", type=SearchFieldDataType.String),
-                SimpleField(name="is_table", type=SearchFieldDataType.Boolean, filterable=True),
+                SimpleField(name="is_table", type=SearchFieldDataType.Boolean, filterable=True, facetable=True),
                 SimpleField(name="token_count", type=SearchFieldDataType.Int32, filterable=True, sortable=True),
                 SimpleField(name="table_page_number", type=SearchFieldDataType.Int32, filterable=True),
                 
@@ -116,14 +116,37 @@ class AzureSearchDataUploader:
         
         # Check if Index Exists
         try:
-            self.search_index_client.get_index(index_name)
+            index_definition = self.search_index_client.get_index(index_name)
             print(f"✅ Index '{index_name}' already exists")
         except ResourceNotFoundError:
             # Create Index
             print(f"📋 Index '{index_name}' not found, creating...")
             if not self.create_index(index_name):
                 raise ValueError(f"Failed to create index '{index_name}'")
-
+            index_definition = self.search_index_client.get_index(index_name)
+        
+        # Get valid field names from the index schema
+        valid_fields = {field.name for field in index_definition.fields}
+        print(f"📋 Valid fields in index: {sorted(valid_fields)}")
+        
+        # Clean documents to only include valid fields
+        cleaned_documents = []
+        for doc in data:
+            cleaned_doc = {}
+            
+            # Only include fields that exist in the index schema
+            for key, value in doc.items():
+                if key.startswith('@search'):
+                    continue  # Skip Azure Search specific fields
+                elif key in valid_fields:
+                    cleaned_doc[key] = value
+                else:
+                    # Log unknown fields for debugging
+                    if len(cleaned_documents) == 0:  # Only log for first document
+                        print(f"⚠️  Skipping unknown field: '{key}' = {type(value).__name__}")
+            
+            cleaned_documents.append(cleaned_doc)
+        
         # Upload documents
         search_client = SearchClient(
             endpoint=self.azure_ai_search_endpoint,
@@ -131,17 +154,58 @@ class AzureSearchDataUploader:
             credential=AzureKeyCredential(self.azure_ai_search_key)
         )
         
-        print(f"⬆️  Uploading {len(data)} documents...")
-        result = search_client.upload_documents(documents=data)
+        print(f"⬆️  Uploading {len(cleaned_documents)} documents...")
         
-        # Check for failures
-        failed_uploads = [r for r in result if not r.succeeded]
-        if failed_uploads:
-            print(f"⚠️  {len(failed_uploads)} documents failed to upload")
-            for failed in failed_uploads[:3]:  # Show first 3 failures
-                print(f"     Failed: {failed.key} - {failed.error_message}")
-        
-        successful_uploads = len(data) - len(failed_uploads)
-        print(f"✅ {successful_uploads}/{len(data)} documents uploaded successfully")
-        
-        return result
+        # Fix: Use upload_documents with proper parameters
+        try:
+            # Option 1: Upload all at once (for smaller batches)
+            if len(cleaned_documents) <= 1000:
+                result = search_client.upload_documents(documents=cleaned_documents)
+            else:
+                # Option 2: Upload in batches for large datasets
+                results = []
+                batch_size = 1000
+                
+                for i in range(0, len(cleaned_documents), batch_size):
+                    batch = cleaned_documents[i:i + batch_size]
+                    print(f"   Uploading batch {i//batch_size + 1}/{(len(cleaned_documents) + batch_size - 1)//batch_size} ({len(batch)} documents)...")
+                    
+                    batch_result = search_client.upload_documents(documents=batch)
+                    results.extend(batch_result)
+                    
+                    # Add a small delay between batches to avoid throttling
+                    import time
+                    time.sleep(0.5)
+                
+                result = results
+            
+            # Check for failures
+            failed_uploads = [r for r in result if not r.succeeded]
+            if failed_uploads:
+                print(f"⚠️  {len(failed_uploads)} documents failed to upload")
+                for failed in failed_uploads[:5]:  # Show first 5 failures
+                    print(f"     Failed: {failed.key} - {failed.error_message}")
+            
+            successful_uploads = len(cleaned_documents) - len(failed_uploads)
+            print(f"✅ {successful_uploads}/{len(cleaned_documents)} documents uploaded successfully")
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ Error during upload: {str(e)}")
+            print(f"   Error type: {type(e).__name__}")
+            
+            # Try alternative approach with merge_or_upload
+            try:
+                print("🔄 Trying alternative upload method...")
+                result = search_client.merge_or_upload_documents(documents=cleaned_documents)
+                
+                failed_uploads = [r for r in result if not r.succeeded]
+                successful_uploads = len(cleaned_documents) - len(failed_uploads)
+                print(f"✅ Alternative method: {successful_uploads}/{len(cleaned_documents)} documents uploaded")
+                
+                return result
+                
+            except Exception as e2:
+                print(f"❌ Alternative method also failed: {str(e2)}")
+                raise e  # Re-raise the original exception

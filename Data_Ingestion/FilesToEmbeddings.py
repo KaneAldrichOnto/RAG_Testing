@@ -308,7 +308,7 @@ class FilesToEmbeddings:
 if __name__ == "__main__":
     # Initialize the pipeline
     pipeline = FilesToEmbeddings(
-        embedding_model="all-MiniLM-L6-v2",
+        embedding_model="text-embedding-3-small",
         target_chunk_size=512,
         overlap_percentage=0.25
     )
